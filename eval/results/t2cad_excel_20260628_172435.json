@@ -1,0 +1,66 @@
+{
+  "summary": {
+    "project": "t2cad",
+    "tool": "excel",
+    "suite": "gold_set",
+    "total": 1,
+    "passed": 0,
+    "failed": 1,
+    "pass_rate": 0.0,
+    "avg_overall": 0.71,
+    "avg_syntax": 1.0,
+    "avg_safety": 1.0,
+    "avg_task_fit": 0.5,
+    "avg_quality": 0.3,
+    "avg_attempts": 0.0,
+    "avg_elapsed": 0.0,
+    "tag_filter": null,
+    "dry_run": true,
+    "by_suite": {
+      "gold_set": {
+        "pass_rate": 0.0,
+        "total": 1
+      }
+    }
+  },
+  "results": [
+    {
+      "case_name": "简单排序",
+      "suite": "gold_set",
+      "difficulty": "easy",
+      "tags": [
+        "sort",
+        "basic"
+      ],
+      "code": "",
+      "code_hash": "e3b0c44298fc",
+      "scores": {
+        "syntax": 1.0,
+        "safety": 1.0,
+        "task_fit": 0.5,
+        "quality": 0.3,
+        "overall": 0.71
+      },
+      "details": {
+        "syntax": "语法正确",
+        "safety": "安全: 无违规",
+        "task_fit": "任务匹配:\n  ❌ 缺少必要函数: V\n  ❌ 缺少必要函数: BEAUTIFY\n  ⚠️ 未找到期望操作: ['sort', 'Sort', '排序']",
+        "quality": "代码质量:\n  ⚠️ 代码过短（可能不完整）"
+      },
+      "pipeline": {
+        "success": false,
+        "attempts": 0,
+        "result": "dry run"
+      },
+      "passed": false,
+      "elapsed_sec": 0.0
+    }
+  ],
+  "meta": {
+    "project": "t2cad",
+    "tool": "excel",
+    "timestamp": "2026-06-28T17:24:35.418638",
+    "label": "",
+    "eval_version": 2
+  }
+}

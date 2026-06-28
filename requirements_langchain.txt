@@ -1,0 +1,7 @@
+# LangChain + LangGraph dependencies for TextToCAD
+# Install: pip install -r requirements_langchain.txt
+
+langchain>=0.3.0
+langgraph>=0.2.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0

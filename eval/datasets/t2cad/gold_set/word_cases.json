@@ -1,0 +1,41 @@
+{
+  "project": "t2cad",
+  "tool": "word",
+  "suite": "gold_set",
+  "version": 2,
+  "updated": "2026-06-28T17:21:35.250871",
+  "count": 1,
+  "cases": [
+    {
+      "name": "生成标准报告",
+      "description": "创建带格式的文档报告",
+      "snapshot": "空白文档。页边距: 上下25.4mm 左右31.8mm。",
+      "user_input": "创建报告：标题'Q2生产总结'居中加粗24pt，下面一个3列4行的表格(日期/产量/合格率)，填充示例数据，表格表头深蓝底白字",
+      "checks": {
+        "must_use": [],
+        "must_not_use": [
+          "import ",
+          "Dispatch",
+          "Documents.Open"
+        ],
+        "expected_operations": [
+          "Table",
+          "table",
+          "表格",
+          "Add"
+        ],
+        "should_contain": [
+          "Bold",
+          "Color",
+          "Heading"
+        ]
+      },
+      "difficulty": "medium",
+      "tags": [
+        "report",
+        "table",
+        "basic"
+      ]
+    }
+  ]
+}

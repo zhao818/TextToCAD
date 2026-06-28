@@ -3,6 +3,12 @@
 import os, sys, json, re, traceback, time, subprocess
 from pathlib import Path
 
+# ── shared LLM + pipeline modules ──
+CONFIG_DIR = Path.home() / ".text_to_cad"
+sys.path.insert(0, str(CONFIG_DIR))
+from t2cad_llm import LLMClient, load_config, resolve_proxies, strip_code_fence
+from t2cad_pipeline import CodeGenPipeline
+
 LOG_FILE = os.path.join(os.path.expanduser("~"), "t2cad_excel_debug.log")
 
 def _log(msg):
@@ -322,9 +328,25 @@ class ExcelConnection:
 
     def connect(self, create=False):
         import win32com.client
+        import pythoncom
         try:
-            self.excel = win32com.client.Dispatch("Excel.Application")
-            self.excel.Visible = True
+            if create:
+                # Force a brand-new Excel instance (skip ROT lookup)
+                self.excel = win32com.client.DispatchEx("Excel.Application")
+            else:
+                # Try to attach to an already-running Excel first
+                try:
+                    self.excel = win32com.client.GetActiveObject("Excel.Application")
+                except Exception:
+                    self.excel = win32com.client.Dispatch("Excel.Application")
+
+            # Visible may fail due to gen_py early-binding clash or DCOM perms —
+            # treat it as non-fatal; the COM handle still works for automation.
+            try:
+                self.excel.Visible = True
+            except Exception:
+                pass
+
             _ = self.excel.Name
             self.connected = True
             self.error = ""
@@ -481,6 +503,9 @@ class TextToCADApp(QtWidgets.QMainWindow):
         self.proxies = _resolve_proxies(self.cfg.get("proxies")) if HAS_REQUESTS else None
         self.conn = conn
         self._cancelled = False
+        # LangChain-powered LLM client + pipeline
+        self.client = LLMClient(self.cfg)
+        self.pipeline = CodeGenPipeline(self.client)
 
         self.setWindowTitle("TextToCAD for Excel v2")
         self.setMinimumSize(420, 480)
@@ -646,8 +671,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
             ws.Columns.AutoFit()
             # Freeze top row
             try:
-                ws.Range(ws.Cells(2, 1)).Select()
-                self.conn.excel.ActiveWindow.FreezePanes = True
+                self._freeze_top_row(ws)
             except:
                 pass
             self.set_status("美化完成: 边框+表头+列宽+冻结", "green")
@@ -658,14 +682,52 @@ class TextToCADApp(QtWidgets.QMainWindow):
         try: self.conn.ensure(); self.conn.ws.Columns.AutoFit(); self.set_status("自动列宽完成", "green")
         except Exception as e: self.set_status(f"失败: {e}", "red")
 
+    def _freeze_top_row(self, ws):
+        """Freeze top row of given worksheet. Tries multiple approaches for robustness."""
+        excel = self.conn.excel
+        ws.Activate()
+
+        # ── resolve window: try ActiveWindow first, then wb.Windows(1) ──
+        win = None
+        try:
+            win = excel.ActiveWindow
+        except Exception:
+            pass
+        if win is None:
+            try:
+                win = self.conn.wb.Windows(1)
+            except Exception:
+                pass
+        if win is None:
+            raise RuntimeError("无法获取 Excel 窗口对象")
+
+        # ── cancel conflicting states before freeze ──
+        try:
+            win.Split = False       # Split 和 FreezePanes 互斥
+        except Exception:
+            pass
+        try:
+            win.View = 1            # xlNormalView — 页面布局/分页预览下 FreezePanes 失败
+        except Exception:
+            pass
+        try:
+            win.FreezePanes = False # 取消已有冻结
+        except Exception:
+            pass
+
+        # ── freeze at row 2 (freezes row 1) ──
+        # NOTE: 用字符串地址，不能用 Range(Cells(...))，gen_py 早期绑定时会炸
+        ws.Range("A2").Select()
+        win.FreezePanes = True
+
     def on_freeze(self):
         try:
             self.conn.ensure()
-            ws = self.conn.ws
-            ws.Range(ws.Cells(2, 1)).Select()
-            self.conn.excel.ActiveWindow.FreezePanes = True
+            self._freeze_top_row(self.conn.ws)
             self.set_status("已冻结首行", "green")
-        except Exception as e: self.set_status(f"失败: {e}", "red")
+        except Exception as e:
+            _log(f"on_freeze FAILED:\n{traceback.format_exc()}")
+            self.set_status(f"失败: {e}", "red")
 
     def _call_llm(self, messages):
         if self.cfg["provider"] == "bridge":
@@ -728,7 +790,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
                 {"role": "system", "content": "你是Excel数据分析专家。根据工作簿快照回答用户问题。关注所有工作表、名称管理器、跨表引用。直接给结论。"},
                 {"role": "user", "content": user_msg},
             ]
-            answer = self._call_llm(messages)
+            answer = self.client.chat(messages)
             t2 = time.time()
             label = "查询" if question else "分析"
             self.output_edit.setText(f"--- {label} ({(t2-t1)*1000:.0f}ms) ---\n{answer}")
@@ -783,7 +845,8 @@ class TextToCADApp(QtWidgets.QMainWindow):
                         fixer_code = None
                         self.output_edit.setText(f"--- 专家修正版 ---\n{code}")
                     else:
-                        code = self._call_llm(messages)
+                        code = self.client.chat(messages)
+                        code = strip_code_fence(code)
                         self.output_edit.setText(f"--- {attempt+1}/{MAX_RETRIES} ---\n{code}")
 
                     # ── sanitize common LLM artifacts ──
@@ -886,18 +949,35 @@ class TextToCADApp(QtWidgets.QMainWindow):
 
                     def _freeze(r, c):
                         """Freeze panes at row r, col c (0=no freeze in that dim)."""
+                        ws.Activate()
+                        # resolve window: try ActiveWindow, fallback to wb.Windows(1)
+                        win = None
+                        try:
+                            win = excel.ActiveWindow
+                        except Exception:
+                            pass
+                        if win is None:
+                            win = wb.Windows(1)
+                        try:
+                            win.Split = False       # Split 和 FreezePanes 互斥
+                        except Exception:
+                            pass
+                        try:
+                            win.View = 1            # xlNormalView
+                        except Exception:
+                            pass
+                        try:
+                            win.FreezePanes = False
+                        except Exception:
+                            pass
                         if r and c:
-                            ws.Activate()
-                            ws.Range(ws.Cells(r + 1, c + 1)).Select()
-                            excel.ActiveWindow.FreezePanes = True
+                            ws.Cells(r + 1, c + 1).Select()
                         elif r:
-                            ws.Activate()
-                            ws.Range(ws.Cells(r + 1, 1)).Select()
-                            excel.ActiveWindow.FreezePanes = True
+                            ws.Cells(r + 1, 1).Select()
                         elif c:
-                            ws.Activate()
-                            ws.Range(ws.Cells(1, c + 1)).Select()
-                            excel.ActiveWindow.FreezePanes = True
+                            ws.Cells(1, c + 1).Select()
+                        if r or c:
+                            win.FreezePanes = True
 
                     def _autofit():
                         ws.Columns.AutoFit()

@@ -8,6 +8,8 @@ LOG_FILE = os.path.join(os.path.expanduser("~"), "t2cad_word_debug.log")
 CONFIG_DIR = Path.home() / ".text_to_cad"
 sys.path.insert(0, str(CONFIG_DIR))
 from t2cad_fixer import explain_error, web_search, fix_code
+from t2cad_llm import LLMClient, strip_code_fence
+from t2cad_pipeline import CodeGenPipeline
 
 def _log(msg):
     try:
@@ -330,6 +332,8 @@ class TextToCADApp(QtWidgets.QMainWindow):
         self.proxies = _resolve_proxies(self.cfg.get("proxies")) if HAS_REQUESTS else None
         self.conn = conn
         self._cancelled = False
+        self.client = LLMClient(self.cfg)
+        self.pipeline = CodeGenPipeline(self.client)
 
         self.setWindowTitle("TextToCAD for Word v2")
         self.setMinimumSize(400, 480)
@@ -636,7 +640,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
             self.set_status("AI 分析中...", "#9C27B0")
             QtCore.QCoreApplication.processEvents()
 
-            analysis = self._call_llm([
+            analysis = self.client.chat([
                 {"role": "system", "content": "你是文档结构分析专家。只输出结构标签，不要解释。"},
                 {"role": "user", "content": analysis_prompt},
             ])
@@ -1432,7 +1436,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
                 {"role": "system", "content": "你是文档分析专家。用户会给你文档文本，请根据内容回答问题。"},
                 {"role": "user", "content": user_msg},
             ]
-            answer = self._call_llm(messages)
+            answer = self.client.chat(messages)
             label = "查询结果" if question else "文档总结"
             self.output_edit.setText(f"--- {label} ---\n{answer}")
             self.set_status("分析完成", "green")
@@ -1487,7 +1491,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
                     fixer_code = None
                     self.output_edit.setText(f"--- 专家修正版 ---\n{code}")
                 else:
-                    code = self._call_llm(messages)
+                    code = self.client.chat(messages)
                     self.output_edit.setText(f"--- {attempt+1}/{MAX_RETRIES} ---\n{code}")
 
                 wd = self.conn.word

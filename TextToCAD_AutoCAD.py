@@ -8,6 +8,8 @@ LOG_FILE = os.path.join(os.path.expanduser("~"), "t2cad_autocad_debug.log")
 CONFIG_DIR = Path.home() / ".text_to_cad"
 sys.path.insert(0, str(CONFIG_DIR))
 from t2cad_fixer import explain_error, web_search, fix_code
+from t2cad_llm import LLMClient, strip_code_fence
+from t2cad_pipeline import CodeGenPipeline
 
 def _log(msg):
     try:
@@ -257,6 +259,8 @@ class TextToCADApp(QtWidgets.QMainWindow):
         self.proxies = _resolve_proxies(self.cfg.get("proxies")) if HAS_REQUESTS else None
         self.acad_conn = acad_conn
         self._cancelled = False
+        self.client = LLMClient(self.cfg)
+        self.pipeline = CodeGenPipeline(self.client)
 
         self.setWindowTitle("TextToCAD for AutoCAD v3")
         self.setMinimumSize(400, 480)
@@ -761,7 +765,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
                 {"role": "system", "content": "你是 AutoCAD 图形分析专家。根据图纸概览（图层/块/布局/对象统计）和对象细表回答问题。关注全局结构。"},
                 {"role": "user", "content": user_msg},
             ]
-            answer = self._call_llm(messages)
+            answer = self.client.chat(messages)
             self.output_edit.setText(f"--- {label} ---\n{answer}")
             self.set_status("查询完成", "green")
         except Exception as e:
@@ -814,7 +818,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
                     fixer_code_acad = None
                     self.output_edit.setText(f"--- 专家修正版 ---\n{code}")
                 else:
-                    code = self._call_llm(messages)
+                    code = self.client.chat(messages)
                     self.output_edit.setText(f"--- {attempt+1}/{MAX_RETRIES} ---\n{code}")
 
                 # Safe helpers injected into exec namespace

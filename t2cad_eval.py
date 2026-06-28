@@ -1,42 +1,30 @@
 #!/usr/bin/env python3
-# t2cad_eval.py — TextToCAD 评测引擎
+# t2cad_eval.py V2 — TextToCAD 评测引擎（项目级）
 """
-Eval-driven development for TextToCAD tools.
+Eval-driven development for TextToCAD tools — V2 Project-Level.
 
-Architecture:
-  t2cad_eval.py run <tool>     → 跑全量测试用例
-  t2cad_eval.py compare        → 对比两次评测结果（提示词迭代前后）
-  t2cad_eval.py report         → 生成评测报告（含趋势图数据）
+Directory (V2):
+  ~/.text_to_cad/
+  ├── t2cad_eval.py              # 引擎（通用）
+  ├── config/
+  │   └── t2cad.yaml             # 项目配置（可选）
+  └── eval/
+      ├── datasets/
+      │   └── <project>/         # 如 t2cad, sql-gen
+      │       ├── gold_set/      # 黄金集（必须全过）
+      │       ├── edge_cases/    # 边界样本（测鲁棒性）
+      │       └── regression/    # 回归测试（以前犯的错）
+      └── results/               # 历史运行结果
 
-Test case format (eval/cases/<tool>_cases.json):
-  {
-    "name": "简单排序",
-    "description": "把A列按数值降序排列",
-    "snapshot": "Sheet 1: 数据表\\nA1: 姓名 B1: 销售额",
-    "user_input": "按销售额从高到低排序",
-    "checks": {
-      "must_use": ["V"],
-      "must_not_use": ["import ", "Dispatch", "open(", "print("],
-      "expected_operations": ["sort", "Sort", "排序"],
-      "should_contain": ["BEAUTIFY"]
-    },
-    "difficulty": "easy",
-    "tags": ["sort", "basic"]
-  }
-
-Scoring:
-  Syntax     (20%) — code passes ast.parse()
-  Safety     (30%) — no banned patterns, uses safe functions
-  Task Fit   (30%) — contains expected operations
-  Quality    (20%) — readability, naming, structure
-  Overall    ≥ 90% → PASS
+Test case format (unchanged):
+  { name, description, snapshot, user_input, checks, difficulty, tags }
 
 Usage:
-  python t2cad_eval.py run excel        # 跑 Excel 全部用例
-  python t2cad_eval.py run excel --tag sort  # 只跑排序相关
-  python t2cad_eval.py run excel --dry   # 不调 LLM，只评测已有代码
-  python t2cad_eval.py compare           # 对比最近两次
-  python t2cad_eval.py report --tool excel  # 生成报告
+  python t2cad_eval.py run --project t2cad --tool excel
+  python t2cad_eval.py run --project t2cad --tool excel --suite regression
+  python t2cad_eval.py run --project t2cad --tool excel --suite all --dry
+  python t2cad_eval.py compare --project t2cad --tool excel
+  python t2cad_eval.py report --project t2cad --last 7days --format markdown
 """
 
 import ast
@@ -46,23 +34,22 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
 # ── Paths ──────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".text_to_cad"
 EVAL_DIR = CONFIG_DIR / "eval"
-CASES_DIR = EVAL_DIR / "cases"
+DATASETS_DIR = EVAL_DIR / "datasets"
 RESULTS_DIR = EVAL_DIR / "results"
-EVAL_CONFIG_FILE = EVAL_DIR / "eval_config.json"
 
-for d in [EVAL_DIR, CASES_DIR, RESULTS_DIR]:
+for d in [EVAL_DIR, DATASETS_DIR, RESULTS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(CONFIG_DIR))
 
-# ── Scoring weights ────────────────────────────────────
+# ── Constants ──────────────────────────────────────────
 WEIGHTS = {
     "syntax": 0.20,
     "safety": 0.30,
@@ -71,6 +58,7 @@ WEIGHTS = {
 }
 
 PASS_THRESHOLD = 0.90
+SUITES = ["gold_set", "edge_cases", "regression"]
 
 # ── Safety: banned patterns ────────────────────────────
 BANNED_PATTERNS = [
@@ -86,14 +74,13 @@ BANNED_PATTERNS = [
     (r'\bsubprocess\b', "禁止 subprocess"),
     (r'\beval\s*\(', "禁止 eval()"),
     (r'\bexec\s*\(', "禁止 exec()（代码本身在 exec 中运行）"),
-    (r'\bWorkbooks\.Open\b', "禁止 Workbooks.Open（工作簿已打开）"),
+    (r'\bWorkbooks\.Open\b', "禁止 Workbooks.Open"),
     (r'\bPresentations\.Open\b', "禁止 Presentations.Open"),
     (r'\bDocuments\.Open\b', "禁止 Documents.Open"),
 ]
 
-# ── Quality: anti-patterns ─────────────────────────────
 QUALITY_ANTI_PATTERNS = [
-    (r'except\s*:', "裸 except: 应该指定具体异常类型"),
+    (r'except\s*:', "裸 except: 应指定具体异常类型"),
     (r'except\s+Exception\s*:', "裸 catch Exception 太宽泛"),
     (r'\bwhile\s+True\b', "while True 可能死循环"),
     (r'[a-z]\s*=\s*[a-z]\s*=\s*[a-z]', "一行多个赋值影响可读性"),
@@ -102,37 +89,93 @@ QUALITY_ANTI_PATTERNS = [
 QUALITY_POSITIVE = [
     (r'#', "包含注释"),
     (r'def\s+\w+', "使用函数封装"),
-    (r'[A-Z][a-z]+(?:[A-Z][a-z]+)+', "变量名使用驼峰/下划线"),
 ]
 
 
 # ════════════════════════════════════════════════════════
-# Test Case Management
+# V2: Dataset management (project × suite × tool)
 # ════════════════════════════════════════════════════════
 
-def load_cases(tool_name: str) -> list[dict]:
-    """Load test cases for a tool."""
-    case_file = CASES_DIR / f"{tool_name}_cases.json"
-    if not case_file.exists():
-        return []
-    with open(case_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get("cases", [])
+def _dataset_path(project: str, suite: str, tool: str) -> Path:
+    """Get path to a dataset file."""
+    if suite == "all":
+        return None  # special: load from all suites
+    return DATASETS_DIR / project / suite / f"{tool}_cases.json"
 
 
-def save_cases(tool_name: str, cases: list[dict]):
-    """Save test cases for a tool."""
-    CASES_DIR.mkdir(parents=True, exist_ok=True)
-    case_file = CASES_DIR / f"{tool_name}_cases.json"
+def load_cases(project: str, tool: str, suite: str = "all") -> list[dict]:
+    """Load test cases from project/dataset hierarchy.
+
+    suite='all' merges gold_set + edge_cases + regression.
+    """
+    all_cases = []
+
+    suites_to_load = SUITES if suite == "all" else [suite]
+
+    for s in suites_to_load:
+        path = DATASETS_DIR / project / s / f"{tool}_cases.json"
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cases = data.get("cases", [])
+            # Tag each case with its source suite
+            for c in cases:
+                c["_suite"] = s
+            all_cases.extend(cases)
+
+    return all_cases
+
+
+def save_cases(project: str, tool: str, cases: list[dict], suite: str = "gold_set"):
+    """Save test cases to project/dataset hierarchy."""
+    suite_dir = DATASETS_DIR / project / suite
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    case_file = suite_dir / f"{tool}_cases.json"
+
+    # Strip internal _suite tags
+    clean_cases = []
+    for c in cases:
+        clean = dict(c)
+        clean.pop("_suite", None)
+        clean_cases.append(clean)
+
     data = {
-        "tool": tool_name,
-        "version": 1,
+        "project": project,
+        "tool": tool,
+        "suite": suite,
+        "version": 2,
         "updated": datetime.now().isoformat(),
-        "count": len(cases),
-        "cases": cases,
+        "count": len(clean_cases),
+        "cases": clean_cases,
     }
     with open(case_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def migrate_v1_to_v2():
+    """Migrate old eval/cases/<tool>_cases.json → new datasets/t2cad/gold_set/"""
+    old_cases_dir = EVAL_DIR / "cases"
+    if not old_cases_dir.exists():
+        return
+
+    for old_file in old_cases_dir.glob("*_cases.json"):
+        tool = old_file.stem.replace("_cases", "")
+        with open(old_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cases = data.get("cases", [])
+
+        # Move to new structure
+        new_dir = DATASETS_DIR / "t2cad" / "gold_set"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        new_file = new_dir / f"{tool}_cases.json"
+
+        if not new_file.exists():
+            save_cases("t2cad", tool, cases, "gold_set")
+            print(f"  ✅ 已迁移: {tool} ({len(cases)} 用例) → datasets/t2cad/gold_set/")
+
+    # Rename old dir to .bak
+    old_cases_dir.rename(EVAL_DIR / "cases.v1.bak")
+    print(f"  📦 旧目录已备份: cases.v1.bak")
 
 
 # ════════════════════════════════════════════════════════
@@ -140,7 +183,6 @@ def save_cases(tool_name: str, cases: list[dict]):
 # ════════════════════════════════════════════════════════
 
 def check_syntax(code: str) -> tuple[float, str]:
-    """Check if code is valid Python syntax. Returns (score, detail)."""
     try:
         ast.parse(code)
         return 1.0, "语法正确"
@@ -149,42 +191,33 @@ def check_syntax(code: str) -> tuple[float, str]:
 
 
 def check_safety(code: str) -> tuple[float, str]:
-    """Check for banned patterns. Returns (score, detail)."""
     violations = []
     for pattern, desc in BANNED_PATTERNS:
         if re.search(pattern, code):
             violations.append(f"  ❌ {desc}")
-
     if not violations:
         return 1.0, "安全: 无违规"
-
     score = max(0.0, 1.0 - len(violations) * 0.15)
     return score, "安全违规:\n" + "\n".join(violations)
 
 
 def check_task_fit(code: str, case: dict) -> tuple[float, str]:
-    """Check if code matches expected task patterns. Returns (score, detail)."""
     checks = case.get("checks", {})
     score = 1.0
     details = []
 
-    # Must-use functions
-    must_use = checks.get("must_use", [])
-    for func in must_use:
+    for func in checks.get("must_use", []):
         if func not in code:
             score -= 0.15
             details.append(f"  ❌ 缺少必要函数: {func}")
         else:
             details.append(f"  ✅ 使用: {func}")
 
-    # Must-not-use
-    must_not = checks.get("must_not_use", [])
-    for pattern in must_not:
+    for pattern in checks.get("must_not_use", []):
         if pattern in code:
             score -= 0.2
             details.append(f"  ❌ 不应使用: {pattern}")
 
-    # Expected operations
     expected = checks.get("expected_operations", [])
     found_any = False
     for op in expected:
@@ -196,9 +229,7 @@ def check_task_fit(code: str, case: dict) -> tuple[float, str]:
         score -= 0.2
         details.append(f"  ⚠️ 未找到期望操作: {expected}")
 
-    # Should contain (bonus, not penalty)
-    should = checks.get("should_contain", [])
-    for item in should:
+    for item in checks.get("should_contain", []):
         if item in code:
             details.append(f"  ✅ 含推荐项: {item}")
 
@@ -206,23 +237,19 @@ def check_task_fit(code: str, case: dict) -> tuple[float, str]:
 
 
 def check_quality(code: str) -> tuple[float, str]:
-    """Check code quality. Returns (score, detail)."""
-    score = 0.5  # baseline
+    score = 0.5
     details = []
 
-    # Anti-patterns
     for pattern, desc in QUALITY_ANTI_PATTERNS:
         if re.search(pattern, code):
             score -= 0.1
             details.append(f"  ⚠️ {desc}")
 
-    # Positive patterns
     for pattern, desc in QUALITY_POSITIVE:
         if re.search(pattern, code):
             score += 0.1
             details.append(f"  ✅ {desc}")
 
-    # Length check
     lines = code.strip().split("\n")
     if len(lines) < 3:
         score -= 0.2
@@ -231,7 +258,6 @@ def check_quality(code: str) -> tuple[float, str]:
         score -= 0.1
         details.append("  ⚠️ 代码过长（>200行）")
 
-    # Variable naming
     var_pattern = re.findall(r'^(\w+)\s*=', code, re.MULTILINE)
     single_char_vars = [v for v in var_pattern if len(v) == 1 and v not in ('x', 'y', 'z', 'i', 'j', 'k', 'n')]
     if len(single_char_vars) > 3:
@@ -246,13 +272,10 @@ def check_quality(code: str) -> tuple[float, str]:
 # ════════════════════════════════════════════════════════
 
 class EvalEngine:
-    """Run test cases through LLM pipeline and score results."""
-
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
         self.client = None
         self.pipeline = None
-
         if not dry_run:
             from t2cad_llm import get_client
             from t2cad_pipeline import CodeGenPipeline
@@ -261,11 +284,9 @@ class EvalEngine:
 
     def evaluate_one(self, case: dict, system_prompt: str,
                      fixer_prompt: str = "", exec_ns: dict = None) -> dict:
-        """Evaluate a single test case."""
         start_time = time.time()
 
         if self.dry_run:
-            # Dry run: use pre-existing code if provided
             code = case.get("_dry_code", "")
             pipeline_result = {"success": bool(code), "code": code,
                               "result": "dry run", "attempt": 0, "all_codes": [code]}
@@ -276,13 +297,12 @@ class EvalEngine:
                 user_input=case.get("user_input", ""),
                 exec_namespace=exec_ns or {},
                 fixer_prompt=fixer_prompt,
-                max_retries=3,  # Eval uses fewer retries for speed
+                max_retries=3,
             )
 
         code = pipeline_result.get("code", "")
         elapsed = time.time() - start_time
 
-        # Score
         syntax_score, syntax_detail = check_syntax(code)
         safety_score, safety_detail = check_safety(code)
         task_score, task_detail = check_task_fit(code, case)
@@ -297,6 +317,7 @@ class EvalEngine:
 
         return {
             "case_name": case["name"],
+            "suite": case.get("_suite", "unknown"),
             "difficulty": case.get("difficulty", "unknown"),
             "tags": case.get("tags", []),
             "code": code,
@@ -323,15 +344,14 @@ class EvalEngine:
             "elapsed_sec": round(elapsed, 1),
         }
 
-    def run_suite(self, tool_name: str, system_prompt: str,
+    def run_suite(self, project: str, tool: str, system_prompt: str,
                   fixer_prompt: str = "", exec_ns: dict = None,
-                  tag_filter: str = None, limit: int = None) -> dict:
-        """Run all test cases for a tool."""
-        cases = load_cases(tool_name)
+                  suite: str = "all", tag_filter: str = None,
+                  limit: int = None) -> dict:
+        cases = load_cases(project, tool, suite)
         if not cases:
-            return {"error": f"未找到 {tool_name} 的测试用例，请先在 {CASES_DIR}/{tool_name}_cases.json 创建"}
+            return {"error": f"未找到 {project}/{tool} 的测试用例，请先 init"}
 
-        # Filter
         if tag_filter:
             cases = [c for c in cases if tag_filter in c.get("tags", [])]
         if limit:
@@ -343,7 +363,8 @@ class EvalEngine:
 
         for i, case in enumerate(cases):
             print(f"\n{'─'*60}")
-            print(f"[{i+1}/{len(cases)}] {case['name']} ({case.get('difficulty', '?')})")
+            src = case.get("_suite", "?")
+            print(f"[{i+1}/{len(cases)}] {case['name']} ({case.get('difficulty', '?')} / {src})")
             print(f"      输入: {case['user_input'][:80]}...")
 
             if not self.dry_run:
@@ -354,23 +375,23 @@ class EvalEngine:
 
             status = "✅ PASS" if result["passed"] else "❌ FAIL"
             print(f"      {status} 综合: {result['scores']['overall']:.1%}  "
-                  f"语法:{result['scores']['syntax']:.0%} 安全:{result['scores']['safety']:.0%}  "
-                  f"任务:{result['scores']['task_fit']:.0%} 质量:{result['scores']['quality']:.0%}  "
-                  f"尝试:{result['pipeline']['attempts']}次 {result['elapsed_sec']}s")
+                  f"语{result['scores']['syntax']:.0%} 安{result['scores']['safety']:.0%}  "
+                  f"任{result['scores']['task_fit']:.0%} 质{result['scores']['quality']:.0%}  "
+                  f"{result['elapsed_sec']}s")
 
             if not result["passed"]:
                 failed += 1
-                # Show failures
                 for dim in ["syntax", "safety", "task_fit", "quality"]:
                     if result["scores"][dim] < 0.9:
                         print(f"      [{dim}] {result['details'][dim]}")
             else:
                 passed += 1
 
-        # Summary
         avg = sum(r["scores"]["overall"] for r in results) / len(results) if results else 0
         summary = {
-            "tool": tool_name,
+            "project": project,
+            "tool": tool,
+            "suite": suite,
             "total": len(results),
             "passed": passed,
             "failed": failed,
@@ -386,6 +407,20 @@ class EvalEngine:
             "dry_run": self.dry_run,
         }
 
+        # Per-suite breakdown
+        suite_stats = {}
+        for r in results:
+            s = r.get("suite", "?")
+            if s not in suite_stats:
+                suite_stats[s] = {"total": 0, "passed": 0}
+            suite_stats[s]["total"] += 1
+            if r["passed"]:
+                suite_stats[s]["passed"] += 1
+        summary["by_suite"] = {
+            s: {"pass_rate": round(v["passed"] / v["total"], 3), "total": v["total"]}
+            for s, v in suite_stats.items()
+        }
+
         return {"summary": summary, "results": results}
 
 
@@ -393,19 +428,19 @@ class EvalEngine:
 # Results Management
 # ════════════════════════════════════════════════════════
 
-def save_result(tool_name: str, result: dict, label: str = ""):
-    """Save eval result to disk."""
+def save_result(project: str, tool: str, result: dict, label: str = ""):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{tool_name}_{ts}.json"
+    filename = f"{project}_{tool}_{ts}.json"
     if label:
-        filename = f"{tool_name}_{ts}_{label}.json"
+        filename = f"{project}_{tool}_{ts}_{label}.json"
 
     result["meta"] = {
-        "tool": tool_name,
+        "project": project,
+        "tool": tool,
         "timestamp": datetime.now().isoformat(),
         "label": label,
-        "eval_version": 1,
+        "eval_version": 2,
     }
 
     filepath = RESULTS_DIR / filename
@@ -414,53 +449,96 @@ def save_result(tool_name: str, result: dict, label: str = ""):
     return filepath
 
 
-def load_latest_result(tool_name: str) -> Optional[dict]:
-    """Load the most recent eval result for a tool."""
-    files = sorted(RESULTS_DIR.glob(f"{tool_name}_*.json"), reverse=True)
-    if not files:
-        return None
-    with open(files[0], "r", encoding="utf-8") as f:
-        return json.load(f)
+def _parse_project_tool_from_filename(filename: str) -> tuple:
+    """Infer project and tool from filename.
+    V2 format: {project}_{tool}_{YYYYMMDD}_{HHMMSS}[_{label}].json
+    V1 format: {tool}_{YYYYMMDD}_{HHMMSS}.json
+    """
+    import re as _re
+    stem = filename.replace(".json", "")
+    parts = stem.split("_")
+
+    # Find the date part (8 digits)
+    date_idx = None
+    for i, p in enumerate(parts):
+        if _re.match(r'^\d{8}$', p):
+            date_idx = i
+            break
+
+    if date_idx is None:
+        return "unknown", stem
+
+    if date_idx >= 2:
+        # V2: project_tool_YYYYMMDD_...
+        return parts[0], parts[1]
+    elif date_idx == 1:
+        # V1: tool_YYYYMMDD_...
+        return "t2cad", parts[0]
+    return "unknown", parts[0]
 
 
-def list_results(tool_name: str = None) -> list[dict]:
-    """List all saved eval results."""
-    pattern = f"{tool_name}_*.json" if tool_name else "*.json"
-    files = sorted(RESULTS_DIR.glob(pattern), reverse=True)
+def list_results(project: str = None, tool: str = None, days: int = None) -> list[dict]:
+    """List saved eval results, optionally filtered. Handles both V1 and V2 formats."""
+    all_files = sorted(RESULTS_DIR.glob("*.json"), reverse=True)
+
+    # Filter by project/tool from filename and meta
     results = []
-    for f in files:
+    cutoff = datetime.now() - timedelta(days=days) if days else None
+
+    for f in all_files:
         with open(f, "r", encoding="utf-8") as fp:
             data = json.load(fp)
-            meta = data.get("meta", {})
-            summary = data.get("summary", {})
-            results.append({
-                "file": f.name,
-                "tool": meta.get("tool", "?"),
-                "timestamp": meta.get("timestamp", "?"),
-                "label": meta.get("label", ""),
-                "pass_rate": summary.get("pass_rate", 0),
-                "avg_overall": summary.get("avg_overall", 0),
-                "total": summary.get("total", 0),
-            })
+        meta = data.get("meta", {})
+        ts = meta.get("timestamp", "")
+
+        # Determine project/tool: meta first, then filename inference
+        p = meta.get("project") or _parse_project_tool_from_filename(f.name)[0]
+        t = meta.get("tool") or _parse_project_tool_from_filename(f.name)[1]
+
+        if project and p != project:
+            continue
+        if tool and t != tool:
+            continue
+
+        if cutoff and ts:
+            try:
+                if datetime.fromisoformat(ts) < cutoff:
+                    continue
+            except ValueError:
+                pass
+
+        summary = data.get("summary", {})
+        results.append({
+            "file": f.name,
+            "project": p,
+            "tool": t,
+            "timestamp": ts,
+            "label": meta.get("label", ""),
+            "pass_rate": summary.get("pass_rate", 0),
+            "avg_overall": summary.get("avg_overall", 0),
+            "total": summary.get("total", 0),
+            "passed": summary.get("passed", 0),
+            "failed": summary.get("failed", 0),
+            "by_suite": summary.get("by_suite", {}),
+            "full_data": data,
+        })
     return results
 
 
-def compare_results(tool_name: str) -> dict:
+def compare_results(project: str, tool: str) -> dict:
     """Compare the two most recent eval results."""
-    files = sorted(RESULTS_DIR.glob(f"{tool_name}_*.json"), reverse=True)
-    if len(files) < 2:
-        return {"error": f"需要至少2次评测结果才能对比，当前只有 {len(files)} 次"}
+    results = list_results(project=project, tool=tool)
+    if len(results) < 2:
+        return {"error": f"需要至少2次评测结果才能对比，当前只有 {len(results)} 次"}
 
-    with open(files[0], "r", encoding="utf-8") as f:
-        new = json.load(f)
-    with open(files[1], "r", encoding="utf-8") as f:
-        old = json.load(f)
-
+    new = results[0]["full_data"]
+    old = results[1]["full_data"]
     new_sum = new["summary"]
     old_sum = old["summary"]
 
     diff = {
-        "tool": tool_name,
+        "project": project,
+        "tool": tool,
         "new": {"timestamp": new["meta"]["timestamp"], "label": new["meta"].get("label", "")},
         "old": {"timestamp": old["meta"]["timestamp"], "label": old["meta"].get("label", "")},
         "delta": {
@@ -473,23 +551,185 @@ def compare_results(tool_name: str) -> dict:
             "avg_attempts": round(new_sum["avg_attempts"] - old_sum["avg_attempts"], 1),
         },
         "per_case_delta": [],
+        "regression_alert": [],
     }
 
-    # Per-case comparison
     new_cases = {r["case_name"]: r for r in new["results"]}
     old_cases = {r["case_name"]: r for r in old["results"]}
     for name in new_cases:
         if name in old_cases:
             delta = round(new_cases[name]["scores"]["overall"] - old_cases[name]["scores"]["overall"], 3)
-            diff["per_case_delta"].append({
+            item = {
                 "case": name,
                 "old": old_cases[name]["scores"]["overall"],
                 "new": new_cases[name]["scores"]["overall"],
                 "delta": delta,
                 "direction": "📈" if delta > 0 else ("📉" if delta < 0 else "➡️"),
-            })
+                "was_pass": old_cases[name]["passed"],
+                "now_pass": new_cases[name]["passed"],
+            }
+            diff["per_case_delta"].append(item)
+            # Regression alert: was passing, now failing
+            if old_cases[name]["passed"] and not new_cases[name]["passed"]:
+                diff["regression_alert"].append(item)
 
     return diff
+
+
+# ════════════════════════════════════════════════════════
+# V2: Weekly/Monthly Report Generator
+# ════════════════════════════════════════════════════════
+
+def generate_report(project: str, days: int = 7, format: str = "markdown") -> str:
+    """Generate a comprehensive eval report for a time period.
+
+    Args:
+        project: Project name (e.g. 't2cad')
+        days: Number of days to look back
+        format: 'markdown' or 'text'
+
+    Returns report as string.
+    """
+    results = list_results(project=project, days=days)
+    if not results:
+        return f"# {project} 评测报告\n\n暂无最近 {days} 天的评测数据。"
+
+    now = datetime.now()
+    start_date = now - timedelta(days=days)
+    date_range = f"{start_date.strftime('%Y.%m.%d')} - {now.strftime('%Y.%m.%d')}"
+
+    # Group by tool
+    by_tool = {}
+    for r in results:
+        tool = r["tool"]
+        if tool not in by_tool:
+            by_tool[tool] = []
+        by_tool[tool].append(r)
+
+    lines = []
+    lines.append(f"# FDE 项目评测报告 ({date_range})")
+    lines.append("")
+    lines.append(f"> 自动生成于 {now.strftime('%Y-%m-%d %H:%M')} · 数据来源: {len(results)} 次评测")
+    lines.append("")
+
+    # ── 1. Overall Health ──
+    lines.append("## 1. 整体健康度")
+    lines.append("")
+    lines.append("| 工具 | 最新通过率 | 最新均分 | 变化 (vs上周) | 状态 |")
+    lines.append("|------|:--:|:--:|:--:|:--:|")
+
+    for tool, tool_results in sorted(by_tool.items()):
+        latest = tool_results[0]
+        rate = latest["pass_rate"]
+        score = latest["avg_overall"]
+
+        # Compare to previous run
+        delta_str = "—"
+        if len(tool_results) >= 2:
+            prev = tool_results[1]
+            delta = rate - prev["pass_rate"]
+            arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "→")
+            delta_str = f"{arrow} {delta:+.1%}"
+
+        status = "🟢" if rate >= 0.90 else ("🟡" if rate >= 0.70 else "🔴")
+        lines.append(f"| **{tool}** | {rate:.1%} | {score:.1%} | {delta_str} | {status} |")
+
+    lines.append("")
+
+    # ── 2. Key Progress ──
+    lines.append("## 2. 关键进展")
+    lines.append("")
+
+    progress_found = False
+    for tool, tool_results in sorted(by_tool.items()):
+        if len(tool_results) >= 2:
+            newer = tool_results[0]["full_data"]
+            older = tool_results[1]["full_data"]
+
+            # Find cases that improved significantly
+            new_cases = {r["case_name"]: r for r in newer["results"]}
+            old_cases = {r["case_name"]: r for r in older["results"]}
+
+            improved = []
+            for name in new_cases:
+                if name in old_cases:
+                    delta = new_cases[name]["scores"]["overall"] - old_cases[name]["scores"]["overall"]
+                    if delta > 0.05:
+                        improved.append((name, delta, new_cases[name]["scores"]["overall"]))
+
+            if improved:
+                progress_found = True
+                lines.append(f"### {tool}")
+                for name, delta, final in sorted(improved, key=lambda x: -x[1])[:5]:
+                    lines.append(f"- **{name}** ↑{delta:+.0%} → {final:.0%}")
+                lines.append("")
+
+    if not progress_found:
+        lines.append("*本周无显著提升的用例。*")
+        lines.append("")
+
+    # ── 3. Regression Alerts ──
+    lines.append("## 3. 回归警报")
+    lines.append("")
+
+    regression_found = False
+    for tool, tool_results in sorted(by_tool.items()):
+        if len(tool_results) >= 2:
+            diff = compare_results(project, tool)
+            if "regression_alert" in diff and diff["regression_alert"]:
+                regression_found = True
+                lines.append(f"### ⚠️ {tool}")
+                for item in diff["regression_alert"]:
+                    lines.append(f"- **{item['case']}** 📉 {item['old']:.1%} → {item['new']:.1%} ({item['delta']:+.1%}) —— 之前通过，现在失败！")
+                lines.append("")
+
+    if not regression_found:
+        lines.append("*✅ 无回归问题。*")
+        lines.append("")
+
+    # ── 4. Suite Breakdown ──
+    lines.append("## 4. 测试套件明细")
+    lines.append("")
+
+    for tool, tool_results in sorted(by_tool.items()):
+        latest = tool_results[0]
+        by_suite = latest.get("by_suite", {})
+        if by_suite:
+            lines.append(f"### {tool}")
+            lines.append("")
+            lines.append("| 套件 | 通过率 | 用例数 |")
+            lines.append("|------|:--:|:--:|")
+            for suite, stats in sorted(by_suite.items()):
+                lines.append(f"| {suite} | {stats['pass_rate']:.1%} | {stats['total']} |")
+            lines.append("")
+
+    # ── 5. TODO ──
+    lines.append("## 5. 待办事项")
+    lines.append("")
+
+    # Find all failed cases in the latest run
+    todo_items = []
+    for tool, tool_results in sorted(by_tool.items()):
+        latest = tool_results[0]["full_data"]
+        for r in latest["results"]:
+            if not r["passed"]:
+                weakness = []
+                for dim in ["syntax", "safety", "task_fit", "quality"]:
+                    if r["scores"][dim] < 0.9:
+                        weakness.append(dim)
+                todo_items.append(f"- [{tool}] **{r['case_name']}** ({r.get('suite', '?')}) — 弱项: {', '.join(weakness)} ({r['scores']['overall']:.0%})")
+
+    if todo_items:
+        for item in todo_items:
+            lines.append(item)
+    else:
+        lines.append("*🎉 所有用例全部通过！*")
+
+    lines.append("")
+    lines.append("---")
+    lines.append(f"*报告由 t2cad_eval.py V2 自动生成 · {now.strftime('%Y-%m-%d %H:%M:%S')}*")
+
+    return "\n".join(lines)
 
 
 # ════════════════════════════════════════════════════════
@@ -497,18 +737,13 @@ def compare_results(tool_name: str) -> dict:
 # ════════════════════════════════════════════════════════
 
 def get_system_prompt(tool_name: str) -> str:
-    """Get the default system prompt for a tool from its config."""
-    # Try to load from config
     cfg_file = CONFIG_DIR / "config.json"
     if cfg_file.exists():
         with open(cfg_file, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+        if "system_prompt_zh" in cfg:
+            return cfg["system_prompt_zh"]
 
-        key = f"system_prompt_zh"
-        if key in cfg:
-            return cfg[key]
-
-    # Fallback: minimal prompts
     fallbacks = {
         "excel": "你是 Excel 专家。操作 excel/wb/ws。用 V() FIX() BEAUTIFY() 等安全函数。只输出 Python 代码。",
         "cad": "你是 AutoCAD 专家。操作 acad 对象。用 L() C() PLINE() 等安全函数。只输出 Python 代码。",
@@ -519,7 +754,6 @@ def get_system_prompt(tool_name: str) -> str:
 
 
 def get_fixer_prompt(tool_name: str) -> str:
-    """Get default fixer prompt for a tool."""
     fallbacks = {
         "excel": "你是 Excel COM 专家。修正代码。只输出代码。",
         "cad": "你是 AutoCAD COM 专家。修正代码。只输出代码。",
@@ -530,14 +764,8 @@ def get_fixer_prompt(tool_name: str) -> str:
 
 
 def get_exec_namespace(tool_name: str) -> dict:
-    """Get a mock exec namespace for safe evaluation."""
-    # Mock namespace — no real COM objects, just safe function stubs
-    base = {
-        "math": __import__("math"),
-        "re": __import__("re"),
-    }
+    base = {"math": __import__("math"), "re": __import__("re")}
 
-    # Common safe functions (stub versions for syntax validation)
     common = {
         "V": lambda cell=None: None,
         "FIX": lambda cell=None, formula=None: None,
@@ -559,117 +787,61 @@ def get_exec_namespace(tool_name: str) -> dict:
     }
 
     cad_funcs = {
-        "FAST_MODE": lambda b: None,
-        "L": lambda x1, y1, x2, y2, color=None: None,
-        "C": lambda x, y, r, color=None: None,
-        "R": lambda x, y, w, h, color=None: None,
-        "T": lambda x, y, text, size=None: None,
-        "DIM": lambda *args: None,
-        "PLINE": lambda *args: None,
-        "ARC": lambda *args: None,
-        "HATCH": lambda *args: None,
-        "MTEXT": lambda *args: None,
-        "MOVE": lambda obj, dx, dy: None,
-        "ROT": lambda obj, angle: None,
-        "DEL": lambda obj: None,
-        "OBJS": lambda: [],
-        "FIND_OBJS": lambda **kw: [],
-        "DEL_BY_TYPE": lambda t: None,
-        "UNDO": lambda: None,
-        "LAYER": lambda name, color=None: None,
-        "SEND_CMD": lambda cmd: None,
-        "ZOOM_EXT": lambda: None,
-        "ZOOM_WIN": lambda *args: None,
-        "BLOCK_INSERT": lambda *args: None,
-        "SET_COLOR": lambda obj, color: None,
-        "DIM_H": lambda *args: None,
-        "DIM_STYLE": lambda: None,
-    }
-
-    word_funcs = {
-        "TB": lambda *args, **kw: None,
-        "MERGE_CELLS": lambda t, r1, c1, r2, c2: None,
-        "FMT_TABLE": lambda t, **kw: None,
-        "SECTIONS": lambda doc: [],
-        "IMG": lambda path, x, y, w, h: None,
-    }
-
-    ppt_funcs = {
-        "NEW_SLIDE": lambda layout=12: None,
-        "GOTO": lambda n: None,
-        "DEL_SLIDE": lambda n: None,
-        "CLEAR": lambda: None,
-        "TB": lambda x, y, w, h, text, size=32, color=None: None,
-        "TB_STYLE": lambda x, y, w, h, text, size, fc, fill, align=None: None,
-        "SHAPE": lambda t, x, y, w, h, color=None: None,
-        "FILL": lambda sh, color: None,
-        "FONT_COLOR": lambda sh, color: None,
-        "TABLE_SLIDE": lambda r, c, x, y, w, h: None,
-        "CELL_SLIDE": lambda t, r, c, text: None,
-        "TABLE_STYLE": lambda t, color: None,
-        "IMG": lambda path, x, y, w, h: None,
-        "ALIGN_SHAPE": lambda sh, align: None,
-        "Z_ORDER": lambda sh, pos: None,
-        "COLOR": lambda r, g, b: 0,
-        "PTS": lambda mm: mm * 2.835,
+        "FAST_MODE": lambda b: None, "L": lambda *a: None, "C": lambda *a: None,
+        "R": lambda *a: None, "T": lambda *a: None, "DIM": lambda *a: None,
+        "PLINE": lambda *a: None, "ARC": lambda *a: None, "HATCH": lambda *a: None,
+        "MTEXT": lambda *a: None, "MOVE": lambda *a: None, "ROT": lambda *a: None,
+        "DEL": lambda *a: None, "OBJS": lambda: [], "FIND_OBJS": lambda **kw: [],
+        "DEL_BY_TYPE": lambda t: None, "UNDO": lambda: None, "LAYER": lambda *a: None,
+        "SEND_CMD": lambda cmd: None, "ZOOM_EXT": lambda: None, "ZOOM_WIN": lambda *a: None,
+        "BLOCK_INSERT": lambda *a: None, "SET_COLOR": lambda *a: None,
+        "DIM_H": lambda *a: None, "DIM_STYLE": lambda: None,
     }
 
     ns = dict(base)
     ns.update(common)
-
-    if tool_name == "cad":
-        ns.update(cad_funcs)
-    elif tool_name == "word":
-        ns.update(word_funcs)
-    elif tool_name == "ppt":
-        ns.update(ppt_funcs)
-
+    if tool_name == "cad": ns.update(cad_funcs)
     return ns
 
 
 # ════════════════════════════════════════════════════════
-# CLI
+# CLI (V2)
 # ════════════════════════════════════════════════════════
 
 def print_summary(result: dict):
-    """Print a formatted summary."""
     s = result["summary"]
     print(f"\n{'='*60}")
-    print(f"📊 评测总结: {s['tool']}")
+    print(f"📊 评测总结: {s.get('project', '?')}/{s['tool']}")
     print(f"{'='*60}")
     print(f"  通过率:    {s['pass_rate']:.1%} ({s['passed']}/{s['total']})")
     print(f"  综合均分:  {s['avg_overall']:.1%}")
-    print(f"  语法:      {s['avg_syntax']:.1%}")
-    print(f"  安全:      {s['avg_safety']:.1%}")
-    print(f"  任务匹配:  {s['avg_task_fit']:.1%}")
-    print(f"  代码质量:  {s['avg_quality']:.1%}")
-    print(f"  平均尝试:  {s['avg_attempts']} 次")
-    print(f"  平均耗时:  {s['avg_elapsed']}s")
-    if s.get("dry_run"):
-        print(f"  ⚠️  干跑模式（未调LLM）")
+    print(f"  语法: {s['avg_syntax']:.1%}  安全: {s['avg_safety']:.1%}  任务: {s['avg_task_fit']:.1%}  质量: {s['avg_quality']:.1%}")
+    print(f"  平均尝试: {s['avg_attempts']}次  平均耗时: {s['avg_elapsed']}s")
+    if s.get("dry_run"): print(f"  ⚠️  干跑模式")
+    if "by_suite" in s:
+        print(f"\n  按套件:")
+        for suite, stats in s["by_suite"].items():
+            print(f"    {suite}: {stats['pass_rate']:.1%} ({stats['total']}用例)")
 
     grade = "🏆" if s['pass_rate'] >= 0.9 else ("✅" if s['pass_rate'] >= 0.7 else "⚠️")
     verdict = "PASS" if s['pass_rate'] >= PASS_THRESHOLD else "FAIL"
     print(f"\n  {grade} 最终判定: {verdict} (阈值 {PASS_THRESHOLD:.0%})")
 
-    # Per-case breakdown
     print(f"\n{'─'*60}")
     print(f"📋 逐项明细:")
     for r in result["results"]:
         icon = "✅" if r["passed"] else "❌"
-        print(f"  {icon} {r['case_name']:30s} {r['scores']['overall']:.1%}  "
-              f"语{r['scores']['syntax']:.0%} 安{r['scores']['safety']:.0%} "
-              f"任{r['scores']['task_fit']:.0%} 质{r['scores']['quality']:.0%}")
+        print(f"  {icon} {r['case_name']:28s} {r['scores']['overall']:.1%}  "
+              f"{r.get('suite', '?')}")
 
 
 def print_compare(diff: dict):
-    """Print a comparison between two eval runs."""
     d = diff["delta"]
     print(f"\n{'='*60}")
-    print(f"📊 评测对比: {diff['tool']}")
+    print(f"📊 评测对比: {diff['project']}/{diff['tool']}")
     print(f"{'='*60}")
     print(f"  旧: {diff['old']['timestamp']} ({diff['old']['label']})")
-    print(f"  新: {diff['new']['timestamp']} ({diff['new']['label']}）")
+    print(f"  新: {diff['new']['timestamp']} ({diff['new']['label']})")
     print(f"\n  维度变化:")
     for key, label in [("pass_rate", "通过率"), ("avg_overall", "综合"),
                         ("avg_syntax", "语法"), ("avg_safety", "安全"),
@@ -678,14 +850,20 @@ def print_compare(diff: dict):
         arrow = "📈" if delta > 0 else ("📉" if delta < 0 else "➡️")
         print(f"  {arrow} {label}: {delta:+.1%}")
 
-    print(f"\n  逐用例变化:")
+    if diff.get("regression_alert"):
+        print(f"\n  🚨 回归警报:")
+        for item in diff["regression_alert"]:
+            print(f"  ❌ {item['case']}: {item['old']:.1%} → {item['new']:.1%} —— 之前PASS，现在FAIL!")
+
+    print(f"\n  逐用例:")
     for item in diff["per_case_delta"]:
-        print(f"  {item['direction']} {item['case']:30s} {item['old']:.1%} → {item['new']:.1%} ({item['delta']:+.1%})")
+        print(f"  {item['direction']} {item['case']:28s} {item['old']:.1%} → {item['new']:.1%} ({item['delta']:+.1%})")
 
 
 def cmd_run(args: list):
-    """Run eval suite."""
+    project = "t2cad"
     tool = None
+    suite = "all"
     tag = None
     limit = None
     dry = False
@@ -693,7 +871,13 @@ def cmd_run(args: list):
 
     i = 1
     while i < len(args):
-        if args[i] == "--tag" and i + 1 < len(args):
+        if args[i] == "--project" and i + 1 < len(args):
+            project = args[i + 1]; i += 2
+        elif args[i] == "--tool" and i + 1 < len(args):
+            tool = args[i + 1]; i += 2
+        elif args[i] == "--suite" and i + 1 < len(args):
+            suite = args[i + 1]; i += 2
+        elif args[i] == "--tag" and i + 1 < len(args):
             tag = args[i + 1]; i += 2
         elif args[i] == "--limit" and i + 1 < len(args):
             limit = int(args[i + 1]); i += 2
@@ -707,44 +891,52 @@ def cmd_run(args: list):
             i += 1
 
     if not tool:
-        print("用法: t2cad_eval.py run <工具名> [--tag <标签>] [--limit N] [--dry] [--label <备注>]")
-        print("可用工具: excel, cad, word, ppt")
+        print("用法: t2cad_eval.py run --project <项目> --tool <工具> [--suite <套件>] [--tag <标签>] [--dry]")
+        print("套件: gold_set, edge_cases, regression, all (默认)")
         return
 
     sys_prompt = get_system_prompt(tool)
     fixer = get_fixer_prompt(tool)
     ns = get_exec_namespace(tool)
 
-    print(f"🚀 评测: {tool}")
+    print(f"🚀 评测: {project}/{tool}  suite={suite}")
     print(f"   提示词: {sys_prompt[:80]}...")
-    if dry:
-        print(f"   ⚠️  干跑模式（不调LLM）")
+    if dry: print(f"   ⚠️  干跑模式")
 
     engine = EvalEngine(dry_run=dry)
-    result = engine.run_suite(tool, sys_prompt, fixer, ns, tag_filter=tag, limit=limit)
+    result = engine.run_suite(project, tool, sys_prompt, fixer, ns, suite=suite, tag_filter=tag, limit=limit)
 
     if "error" in result:
         print(f"❌ {result['error']}")
         return
 
     print_summary(result)
-    filepath = save_result(tool, result, label)
+    filepath = save_result(project, tool, result, label)
     print(f"\n💾 结果已保存: {filepath}")
 
 
 def cmd_compare(args: list):
-    """Compare two most recent eval runs."""
-    tool = args[1] if len(args) > 1 else None
+    project = "t2cad"
+    tool = None
+
+    i = 1
+    while i < len(args):
+        if args[i] == "--project" and i + 1 < len(args):
+            project = args[i + 1]; i += 2
+        elif not tool:
+            tool = args[i]; i += 1
+        else:
+            i += 1
+
     if not tool:
-        # Try to find from most recent results
-        results = list_results()
+        results = list_results(project=project)
         if results:
             tool = results[0]["tool"]
         else:
-            print("未找到评测结果。先运行: python t2cad_eval.py run <工具名>")
+            print("未找到评测结果。先 run")
             return
 
-    diff = compare_results(tool)
+    diff = compare_results(project, tool)
     if "error" in diff:
         print(f"❌ {diff['error']}")
         return
@@ -752,209 +944,146 @@ def cmd_compare(args: list):
 
 
 def cmd_report(args: list):
-    """Generate eval report."""
-    tool = None
-    for i, a in enumerate(args):
-        if a == "--tool" and i + 1 < len(args):
-            tool = args[i + 1]
-            break
-    if not tool and len(args) > 1:
-        tool = args[1]
+    project = "t2cad"
+    days = 7
+    fmt = "markdown"
+    output = None
 
-    results = list_results(tool)
-    if not results:
-        print("未找到评测结果")
-        return
+    i = 1
+    while i < len(args):
+        if args[i] == "--project" and i + 1 < len(args):
+            project = args[i + 1]; i += 2
+        elif args[i] == "--last" and i + 1 < len(args):
+            val = args[i + 1]
+            if val.endswith("days"):
+                days = int(val.replace("days", ""))
+            elif val.endswith("d"):
+                days = int(val.replace("d", ""))
+            else:
+                days = int(val)
+            i += 2
+        elif args[i] == "--format" and i + 1 < len(args):
+            fmt = args[i + 1]; i += 2
+        elif args[i] == "--output" and i + 1 < len(args):
+            output = args[i + 1]; i += 2
+        else:
+            i += 1
 
-    print(f"\n📋 评测历史 ({len(results)} 次):")
-    print(f"{'─'*80}")
-    print(f"{'时间':<22} {'工具':<10} {'通过率':>8} {'均分':>8} {'用例':>5} {'标签'}")
-    print(f"{'─'*80}")
-    for r in results[:20]:
-        print(f"{r['timestamp']:<22} {r['tool']:<10} {r['pass_rate']:>7.1%} {r['avg_overall']:>7.1%} {r['total']:>5} {r['label']}")
+    report = generate_report(project, days, fmt)
+
+    if output:
+        out_path = Path(output)
+        out_path.write_text(report, encoding="utf-8")
+        print(f"📄 报告已保存: {out_path}")
+    else:
+        print(report)
 
 
 def cmd_init(args: list):
-    """Initialize sample test cases for a tool."""
-    tool = args[1] if len(args) > 1 else None
+    """Initialize test cases. V2: project + suite structure."""
+    project = "t2cad"
+    tool = None
+    suite = "gold_set"
+
+    i = 1
+    while i < len(args):
+        if args[i] == "--project" and i + 1 < len(args):
+            project = args[i + 1]; i += 2
+        elif args[i] == "--suite" and i + 1 < len(args):
+            suite = args[i + 1]; i += 2
+        elif not tool:
+            tool = args[i]; i += 1
+        else:
+            i += 1
+
     if not tool:
-        print("用法: t2cad_eval.py init <工具名>")
-        print("可用: excel, cad, word, ppt")
+        print("用法: t2cad_eval.py init --project <项目> --tool <工具> [--suite <套件>]")
+        print("可用工具: excel, cad, word, ppt")
+        print("可用套件: gold_set (默认), edge_cases, regression")
         return
 
     samples = {
         "excel": [
-            {
-                "name": "简单排序",
-                "description": "按数值列降序排列",
-                "snapshot": "Sheet 1: 销售表\nA1: 姓名 B1: 销售额\nA2: 张三 B2: 15000\nA3: 李四 B3: 23000\nA4: 王五 B4: 18000",
-                "user_input": "按销售额从高到低排序，排完后美化表格",
-                "checks": {
-                    "must_use": ["V", "BEAUTIFY"],
-                    "must_not_use": ["import ", "Dispatch"],
-                    "expected_operations": ["sort", "Sort", "排序"],
-                    "should_contain": ["BEAUTIFY"]
-                },
-                "difficulty": "easy",
-                "tags": ["sort", "basic"]
-            },
-            {
-                "name": "分类汇总",
-                "description": "按部门汇总工资",
-                "snapshot": "Sheet 1: 工资表\nA1: 部门 B1: 姓名 C1: 工资\nA2: 技术部 B2: 张三 C2: 15000\nA3: 销售部 B3: 李四 C3: 12000\nA4: 技术部 B4: 王五 C4: 18000",
-                "user_input": "按部门分类汇总工资总和，新建一个工作表放结果，表头叫'部门工资汇总'",
-                "checks": {
-                    "must_use": ["V", "NEW_SHEET"],
-                    "must_not_use": ["import ", "Dispatch"],
-                    "expected_operations": ["NEW_SHEET", "sum", "汇总"],
-                    "should_contain": ["BEAUTIFY"]
-                },
-                "difficulty": "medium",
-                "tags": ["aggregate", "groupby"]
-            },
-            {
-                "name": "条件格式化",
-                "description": "高亮大于阈值的单元格",
-                "snapshot": "Sheet 1: 质检表\nA1: 批次 B1: 合格率\nA2: B001 B2: 0.95\nA3: B002 B3: 0.82\nA4: B003 B4: 0.97",
-                "user_input": "把合格率低于0.9的单元格标红底色，表头加粗居中，加边框",
-                "checks": {
-                    "must_use": ["V", "BEAUTIFY", "BG"],
-                    "must_not_use": ["import ", "Dispatch"],
-                    "expected_operations": ["BG", "条件", "0.9"],
-                    "should_contain": ["BEAUTIFY", "BG"]
-                },
-                "difficulty": "medium",
-                "tags": ["format", "conditional"]
-            },
-            {
-                "name": "创建图表",
-                "description": "根据数据创建柱状图",
-                "snapshot": "Sheet 1: 月度销售\nA1: 月份 B1: 销售额\nA2: 1月 B2: 50000\nA3: 2月 B3: 65000\nA4: 3月 B4: 48000",
-                "user_input": "根据月份和销售额创建柱状图，标题叫'Q1销售趋势'",
-                "checks": {
-                    "must_use": ["V", "CHART"],
-                    "must_not_use": ["import ", "Dispatch"],
-                    "expected_operations": ["CHART", "chart"],
-                    "should_contain": ["CHART"]
-                },
-                "difficulty": "medium",
-                "tags": ["chart", "visualization"]
-            },
-            {
-                "name": "多表数据清洗",
-                "description": "遍历多个工作表清洗数据",
-                "snapshot": "Workbook: 生产报表.xlsx\nSheet 1: 原材料 (100行: 日期/物料/数量/单价)\nSheet 2: 成品 (80行: 日期/产品/产量/合格数)\nSheet 3: 能耗 (60行: 日期/电/水/气)",
-                "user_input": "遍历所有工作表，把每个表的空行删除，数值列统一保留2位小数，表头加冻结和自动筛选",
-                "checks": {
-                    "must_use": ["V", "LOOP", "BEAUTIFY"],
-                    "must_not_use": ["import ", "Dispatch", "open("],
-                    "expected_operations": ["LOOP", "删除", "delete", "Delete"],
-                    "should_contain": ["FREEZE", "AUTOFIT"]
-                },
-                "difficulty": "hard",
-                "tags": ["clean", "multi-sheet", "loop"]
-            },
+            {"name": "简单排序", "description": "按数值列降序排列",
+             "snapshot": "Sheet 1: 销售表\nA1: 姓名 B1: 销售额\nA2: 张三 B2: 15000\nA3: 李四 B3: 23000\nA4: 王五 B4: 18000",
+             "user_input": "按销售额从高到低排序，排完后美化表格",
+             "checks": {"must_use": ["V", "BEAUTIFY"], "must_not_use": ["import ", "Dispatch"],
+                        "expected_operations": ["sort", "Sort", "排序"], "should_contain": ["BEAUTIFY"]},
+             "difficulty": "easy", "tags": ["sort", "basic"]},
+            {"name": "分类汇总", "description": "按部门汇总工资",
+             "snapshot": "Sheet 1: 工资表\nA1: 部门 B1: 姓名 C1: 工资\nA2: 技术部 B2: 张三 C2: 15000\nA3: 销售部 B3: 李四 C3: 12000\nA4: 技术部 B4: 王五 C4: 18000",
+             "user_input": "按部门分类汇总工资总和，新建一个工作表放结果，表头叫'部门工资汇总'",
+             "checks": {"must_use": ["V", "NEW_SHEET"], "must_not_use": ["import ", "Dispatch"],
+                        "expected_operations": ["NEW_SHEET", "sum", "汇总"], "should_contain": ["BEAUTIFY"]},
+             "difficulty": "medium", "tags": ["aggregate", "groupby"]},
+            {"name": "条件格式化", "description": "高亮低于阈值的单元格",
+             "snapshot": "Sheet 1: 质检表\nA1: 批次 B1: 合格率\nA2: B001 B2: 0.95\nA3: B002 B3: 0.82\nA4: B003 B4: 0.97",
+             "user_input": "把合格率低于0.9的单元格标红底色，表头加粗居中，加边框",
+             "checks": {"must_use": ["V", "BEAUTIFY", "BG"], "must_not_use": ["import ", "Dispatch"],
+                        "expected_operations": ["BG", "条件", "0.9"], "should_contain": ["BEAUTIFY", "BG"]},
+             "difficulty": "medium", "tags": ["format", "conditional"]},
+            {"name": "创建图表", "description": "根据数据创建柱状图",
+             "snapshot": "Sheet 1: 月度销售\nA1: 月份 B1: 销售额\nA2: 1月 B2: 50000\nA3: 2月 B3: 65000\nA4: 3月 B4: 48000",
+             "user_input": "根据月份和销售额创建柱状图，标题叫'Q1销售趋势'",
+             "checks": {"must_use": ["V", "CHART"], "must_not_use": ["import ", "Dispatch"],
+                        "expected_operations": ["CHART", "chart"], "should_contain": ["CHART"]},
+             "difficulty": "medium", "tags": ["chart", "visualization"]},
+            {"name": "多表数据清洗", "description": "遍历多个工作表清洗数据",
+             "snapshot": "Workbook: 生产报表.xlsx\nSheet 1: 原材料 (100行)\nSheet 2: 成品 (80行)\nSheet 3: 能耗 (60行)",
+             "user_input": "遍历所有工作表，删除空行，数值列保留2位小数，表头加冻结和自动筛选",
+             "checks": {"must_use": ["V", "LOOP", "BEAUTIFY"], "must_not_use": ["import ", "Dispatch", "open("],
+                        "expected_operations": ["LOOP", "删除", "delete"], "should_contain": ["FREEZE", "AUTOFIT"]},
+             "difficulty": "hard", "tags": ["clean", "multi-sheet", "loop"]},
         ],
         "cad": [
-            {
-                "name": "简单圆和阵列",
-                "description": "画圆并环形阵列",
-                "snapshot": "空图纸。单位: 毫米。模型空间无对象。",
-                "user_input": "画一个直径50的圆，以原点为中心环形阵列6个，间距60度",
-                "checks": {
-                    "must_use": ["C", "LAYER"],
-                    "must_not_use": ["import ", "Dispatch", "Autocad()"],
-                    "expected_operations": ["array", "Array", "Copy", "copy", "Rotate"],
-                    "should_contain": ["C("]
-                },
-                "difficulty": "easy",
-                "tags": ["circle", "array", "basic"]
-            },
-            {
-                "name": "建筑平面图",
-                "description": "画简单建筑平面",
-                "snapshot": "空图纸。单位: 毫米。",
-                "user_input": "画一个10米×8米的矩形建筑轮廓，墙厚240mm，在四个角放直径400mm的圆柱",
-                "checks": {
-                    "must_use": ["L", "C", "LAYER"],
-                    "must_not_use": ["import ", "Dispatch"],
-                    "expected_operations": ["L(", "C(", "rect"],
-                    "should_contain": ["LAYER"]
-                },
-                "difficulty": "medium",
-                "tags": ["architecture", "wall", "column"]
-            },
-        ],
-        "word": [
-            {
-                "name": "生成标准报告",
-                "description": "创建带格式的文档报告",
-                "snapshot": "空白文档。页边距: 上下25.4mm 左右31.8mm。",
-                "user_input": "创建报告：标题'Q2生产总结'居中加粗24pt，下面一个3列4行的表格(日期/产量/合格率)，填充示例数据，表格表头深蓝底白字",
-                "checks": {
-                    "must_use": [],
-                    "must_not_use": ["import ", "Dispatch", "Documents.Open"],
-                    "expected_operations": ["Table", "table", "表格", "Add"],
-                    "should_contain": ["Bold", "Color", "Heading"]
-                },
-                "difficulty": "medium",
-                "tags": ["report", "table", "basic"]
-            },
-        ],
-        "ppt": [
-            {
-                "name": "生成三页演示",
-                "description": "创建封面+内容+结束页",
-                "snapshot": "空演示文稿。16:9 (960x540)。",
-                "user_input": "生成3页PPT: 封面(深蓝背景+白色大标题'AI赋能制造业')，内容页(3个要点:降本/增效/提质)，结束页(谢谢+联系方式)",
-                "checks": {
-                    "must_use": ["NEW_SLIDE", "TB_STYLE"],
-                    "must_not_use": ["import ", "Dispatch", "Presentations.Open"],
-                    "expected_operations": ["NEW_SLIDE", "TB_STYLE", "封面", "标题"],
-                    "should_contain": ["FILL", "FONT_COLOR"]
-                },
-                "difficulty": "medium",
-                "tags": ["slides", "presentation", "basic"]
-            },
+            {"name": "简单圆和阵列", "description": "画圆并环形阵列",
+             "snapshot": "空图纸。单位: 毫米。",
+             "user_input": "画一个直径50的圆，以原点为中心环形阵列6个，间距60度",
+             "checks": {"must_use": ["C", "LAYER"], "must_not_use": ["import ", "Dispatch", "Autocad()"],
+                        "expected_operations": ["array", "Array", "Copy", "copy"], "should_contain": ["C("]},
+             "difficulty": "easy", "tags": ["circle", "array", "basic"]},
         ],
     }
 
     if tool not in samples:
-        print(f"未知工具: {tool}. 可用: {', '.join(samples.keys())}")
+        print(f"未知工具: {tool}")
         return
 
     cases = samples[tool]
-    save_cases(tool, cases)
-    print(f"✅ 已为 {tool} 创建 {len(cases)} 个示例测试用例")
-    print(f"   路径: {CASES_DIR / f'{tool}_cases.json'}")
-    print(f"   下一步: python t2cad_eval.py run {tool}")
+    save_cases(project, tool, cases, suite)
+    print(f"✅ 已为 {project}/{tool} 创建 {len(cases)} 个用例 → datasets/{project}/{suite}/")
+
+
+def cmd_migrate(args: list):
+    """Migrate V1 cases to V2 structure."""
+    print("📦 迁移 V1 → V2 目录结构...")
+    migrate_v1_to_v2()
+    print("✅ 迁移完成")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("TextToCAD Eval 评测引擎")
-        print("用法:")
-        print("  python t2cad_eval.py init <工具名>         创建示例测试用例")
-        print("  python t2cad_eval.py run <工具名>          跑全量评测")
-        print("  python t2cad_eval.py run <工具名> --dry    干跑（不调LLM）")
-        print("  python t2cad_eval.py compare [工具名]      对比最近两次")
-        print("  python t2cad_eval.py report [--tool 工具名] 评测历史")
+        print("TextToCAD Eval V2 — 项目级评测引擎")
         print("")
-        print("可用工具: excel, cad, word, ppt")
+        print("命令:")
+        print("  init     创建测试用例  [--project <p>] --tool <t> [--suite gold_set]")
+        print("  run      跑评测       [--project <p>] --tool <t> [--suite all] [--dry]")
+        print("  compare  对比最近两次  [--project <p>] <tool>")
+        print("  report   生成周报      [--project <p>] [--last 7days] [--format markdown] [--output file.md]")
+        print("  migrate  迁移 V1→V2")
+        print("")
+        print("套件: gold_set (黄金集) / edge_cases (边界) / regression (回归) / all (全部)")
         return
 
     cmd = sys.argv[1]
-    if cmd == "init":
-        cmd_init(sys.argv[1:])
-    elif cmd == "run":
-        cmd_run(sys.argv[1:])
-    elif cmd == "compare":
-        cmd_compare(sys.argv[1:])
-    elif cmd == "report":
-        cmd_report(sys.argv[1:])
+    if cmd == "init":        cmd_init(sys.argv[1:])
+    elif cmd == "run":       cmd_run(sys.argv[1:])
+    elif cmd == "compare":   cmd_compare(sys.argv[1:])
+    elif cmd == "report":    cmd_report(sys.argv[1:])
+    elif cmd == "migrate":   cmd_migrate(sys.argv[1:])
     else:
         print(f"未知命令: {cmd}")
-        print("可用: init, run, compare, report")
+        print("可用: init, run, compare, report, migrate")
 
 
 if __name__ == "__main__":

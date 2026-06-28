@@ -8,6 +8,8 @@ LOG_FILE = os.path.join(os.path.expanduser("~"), "t2cad_ppt_debug.log")
 CONFIG_DIR = Path.home() / ".text_to_cad"
 sys.path.insert(0, str(CONFIG_DIR))
 from t2cad_fixer import explain_error, web_search, fix_code
+from t2cad_llm import LLMClient, strip_code_fence
+from t2cad_pipeline import CodeGenPipeline
 
 def _log(msg):
     try:
@@ -208,6 +210,8 @@ class TextToCADApp(QtWidgets.QMainWindow):
         self.proxies = _resolve_proxies(self.cfg.get("proxies")) if HAS_REQUESTS else None
         self.conn = conn
         self._cancelled = False
+        self.client = LLMClient(self.cfg)
+        self.pipeline = CodeGenPipeline(self.client)
 
         self.setWindowTitle("TextToCAD for PowerPoint v1")
         self.setMinimumSize(400, 480)
@@ -555,7 +559,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
                 {"role": "system", "content": "你是演示文稿分析专家。请根据结构信息回答问题。"},
                 {"role": "user", "content": user_msg},
             ]
-            answer = self._call_llm(messages)
+            answer = self.client.chat(messages)
             label = "查询结果" if question else "文稿总结"
             self.output_edit.setText(f"--- {label} ---\n{answer}")
             self.set_status("分析完成", "green")
@@ -609,7 +613,7 @@ class TextToCADApp(QtWidgets.QMainWindow):
                     fixer_code = None
                     self.output_edit.setText(f"--- 专家修正版 ---\n{code}")
                 else:
-                    code = self._call_llm(messages)
+                    code = self.client.chat(messages)
                     self.output_edit.setText(f"--- {attempt+1}/{MAX_RETRIES} ---\n{code}")
 
                 pt = self.conn.ppt

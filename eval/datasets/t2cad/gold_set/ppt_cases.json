@@ -1,0 +1,43 @@
+{
+  "project": "t2cad",
+  "tool": "ppt",
+  "suite": "gold_set",
+  "version": 2,
+  "updated": "2026-06-28T17:21:35.248871",
+  "count": 1,
+  "cases": [
+    {
+      "name": "生成三页演示",
+      "description": "创建封面+内容+结束页",
+      "snapshot": "空演示文稿。16:9 (960x540)。",
+      "user_input": "生成3页PPT: 封面(深蓝背景+白色大标题'AI赋能制造业')，内容页(3个要点:降本/增效/提质)，结束页(谢谢+联系方式)",
+      "checks": {
+        "must_use": [
+          "NEW_SLIDE",
+          "TB_STYLE"
+        ],
+        "must_not_use": [
+          "import ",
+          "Dispatch",
+          "Presentations.Open"
+        ],
+        "expected_operations": [
+          "NEW_SLIDE",
+          "TB_STYLE",
+          "封面",
+          "标题"
+        ],
+        "should_contain": [
+          "FILL",
+          "FONT_COLOR"
+        ]
+      },
+      "difficulty": "medium",
+      "tags": [
+        "slides",
+        "presentation",
+        "basic"
+      ]
+    }
+  ]
+}
