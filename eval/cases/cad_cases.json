@@ -1,0 +1,72 @@
+{
+  "tool": "cad",
+  "version": 1,
+  "updated": "2026-06-28T17:05:32.788530",
+  "count": 2,
+  "cases": [
+    {
+      "name": "简单圆和阵列",
+      "description": "画圆并环形阵列",
+      "snapshot": "空图纸。单位: 毫米。模型空间无对象。",
+      "user_input": "画一个直径50的圆，以原点为中心环形阵列6个，间距60度",
+      "checks": {
+        "must_use": [
+          "C",
+          "LAYER"
+        ],
+        "must_not_use": [
+          "import ",
+          "Dispatch",
+          "Autocad()"
+        ],
+        "expected_operations": [
+          "array",
+          "Array",
+          "Copy",
+          "copy",
+          "Rotate"
+        ],
+        "should_contain": [
+          "C("
+        ]
+      },
+      "difficulty": "easy",
+      "tags": [
+        "circle",
+        "array",
+        "basic"
+      ]
+    },
+    {
+      "name": "建筑平面图",
+      "description": "画简单建筑平面",
+      "snapshot": "空图纸。单位: 毫米。",
+      "user_input": "画一个10米×8米的矩形建筑轮廓，墙厚240mm，在四个角放直径400mm的圆柱",
+      "checks": {
+        "must_use": [
+          "L",
+          "C",
+          "LAYER"
+        ],
+        "must_not_use": [
+          "import ",
+          "Dispatch"
+        ],
+        "expected_operations": [
+          "L(",
+          "C(",
+          "rect"
+        ],
+        "should_contain": [
+          "LAYER"
+        ]
+      },
+      "difficulty": "medium",
+      "tags": [
+        "architecture",
+        "wall",
+        "column"
+      ]
+    }
+  ]
+}

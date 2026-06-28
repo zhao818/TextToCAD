@@ -1,0 +1,159 @@
+{
+  "tool": "excel",
+  "version": 1,
+  "updated": "2026-06-28T17:05:32.659460",
+  "count": 5,
+  "cases": [
+    {
+      "name": "简单排序",
+      "description": "按数值列降序排列",
+      "snapshot": "Sheet 1: 销售表\nA1: 姓名 B1: 销售额\nA2: 张三 B2: 15000\nA3: 李四 B3: 23000\nA4: 王五 B4: 18000",
+      "user_input": "按销售额从高到低排序，排完后美化表格",
+      "checks": {
+        "must_use": [
+          "V",
+          "BEAUTIFY"
+        ],
+        "must_not_use": [
+          "import ",
+          "Dispatch"
+        ],
+        "expected_operations": [
+          "sort",
+          "Sort",
+          "排序"
+        ],
+        "should_contain": [
+          "BEAUTIFY"
+        ]
+      },
+      "difficulty": "easy",
+      "tags": [
+        "sort",
+        "basic"
+      ]
+    },
+    {
+      "name": "分类汇总",
+      "description": "按部门汇总工资",
+      "snapshot": "Sheet 1: 工资表\nA1: 部门 B1: 姓名 C1: 工资\nA2: 技术部 B2: 张三 C2: 15000\nA3: 销售部 B3: 李四 C3: 12000\nA4: 技术部 B4: 王五 C4: 18000",
+      "user_input": "按部门分类汇总工资总和，新建一个工作表放结果，表头叫'部门工资汇总'",
+      "checks": {
+        "must_use": [
+          "V",
+          "NEW_SHEET"
+        ],
+        "must_not_use": [
+          "import ",
+          "Dispatch"
+        ],
+        "expected_operations": [
+          "NEW_SHEET",
+          "sum",
+          "汇总"
+        ],
+        "should_contain": [
+          "BEAUTIFY"
+        ]
+      },
+      "difficulty": "medium",
+      "tags": [
+        "aggregate",
+        "groupby"
+      ]
+    },
+    {
+      "name": "条件格式化",
+      "description": "高亮大于阈值的单元格",
+      "snapshot": "Sheet 1: 质检表\nA1: 批次 B1: 合格率\nA2: B001 B2: 0.95\nA3: B002 B3: 0.82\nA4: B003 B4: 0.97",
+      "user_input": "把合格率低于0.9的单元格标红底色，表头加粗居中，加边框",
+      "checks": {
+        "must_use": [
+          "V",
+          "BEAUTIFY",
+          "BG"
+        ],
+        "must_not_use": [
+          "import ",
+          "Dispatch"
+        ],
+        "expected_operations": [
+          "BG",
+          "条件",
+          "0.9"
+        ],
+        "should_contain": [
+          "BEAUTIFY",
+          "BG"
+        ]
+      },
+      "difficulty": "medium",
+      "tags": [
+        "format",
+        "conditional"
+      ]
+    },
+    {
+      "name": "创建图表",
+      "description": "根据数据创建柱状图",
+      "snapshot": "Sheet 1: 月度销售\nA1: 月份 B1: 销售额\nA2: 1月 B2: 50000\nA3: 2月 B3: 65000\nA4: 3月 B4: 48000",
+      "user_input": "根据月份和销售额创建柱状图，标题叫'Q1销售趋势'",
+      "checks": {
+        "must_use": [
+          "V",
+          "CHART"
+        ],
+        "must_not_use": [
+          "import ",
+          "Dispatch"
+        ],
+        "expected_operations": [
+          "CHART",
+          "chart"
+        ],
+        "should_contain": [
+          "CHART"
+        ]
+      },
+      "difficulty": "medium",
+      "tags": [
+        "chart",
+        "visualization"
+      ]
+    },
+    {
+      "name": "多表数据清洗",
+      "description": "遍历多个工作表清洗数据",
+      "snapshot": "Workbook: 生产报表.xlsx\nSheet 1: 原材料 (100行: 日期/物料/数量/单价)\nSheet 2: 成品 (80行: 日期/产品/产量/合格数)\nSheet 3: 能耗 (60行: 日期/电/水/气)",
+      "user_input": "遍历所有工作表，把每个表的空行删除，数值列统一保留2位小数，表头加冻结和自动筛选",
+      "checks": {
+        "must_use": [
+          "V",
+          "LOOP",
+          "BEAUTIFY"
+        ],
+        "must_not_use": [
+          "import ",
+          "Dispatch",
+          "open("
+        ],
+        "expected_operations": [
+          "LOOP",
+          "删除",
+          "delete",
+          "Delete"
+        ],
+        "should_contain": [
+          "FREEZE",
+          "AUTOFIT"
+        ]
+      },
+      "difficulty": "hard",
+      "tags": [
+        "clean",
+        "multi-sheet",
+        "loop"
+      ]
+    }
+  ]
+}

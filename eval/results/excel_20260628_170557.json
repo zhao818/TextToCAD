@@ -1,0 +1,86 @@
+{
+  "summary": {
+    "tool": "excel",
+    "total": 2,
+    "passed": 0,
+    "failed": 2,
+    "pass_rate": 0.0,
+    "avg_overall": 0.71,
+    "avg_syntax": 1.0,
+    "avg_safety": 1.0,
+    "avg_task_fit": 0.5,
+    "avg_quality": 0.3,
+    "avg_attempts": 0.0,
+    "avg_elapsed": 0.0,
+    "tag_filter": null,
+    "dry_run": true
+  },
+  "results": [
+    {
+      "case_name": "简单排序",
+      "difficulty": "easy",
+      "tags": [
+        "sort",
+        "basic"
+      ],
+      "code": "",
+      "code_hash": "e3b0c44298fc",
+      "scores": {
+        "syntax": 1.0,
+        "safety": 1.0,
+        "task_fit": 0.5,
+        "quality": 0.3,
+        "overall": 0.71
+      },
+      "details": {
+        "syntax": "语法正确",
+        "safety": "安全: 无违规",
+        "task_fit": "任务匹配:\n  ❌ 缺少必要函数: V\n  ❌ 缺少必要函数: BEAUTIFY\n  ⚠️ 未找到期望操作: ['sort', 'Sort', '排序']",
+        "quality": "代码质量:\n  ⚠️ 代码过短（可能不完整）"
+      },
+      "pipeline": {
+        "success": false,
+        "attempts": 0,
+        "result": "dry run"
+      },
+      "passed": false,
+      "elapsed_sec": 0.0
+    },
+    {
+      "case_name": "分类汇总",
+      "difficulty": "medium",
+      "tags": [
+        "aggregate",
+        "groupby"
+      ],
+      "code": "",
+      "code_hash": "e3b0c44298fc",
+      "scores": {
+        "syntax": 1.0,
+        "safety": 1.0,
+        "task_fit": 0.5,
+        "quality": 0.3,
+        "overall": 0.71
+      },
+      "details": {
+        "syntax": "语法正确",
+        "safety": "安全: 无违规",
+        "task_fit": "任务匹配:\n  ❌ 缺少必要函数: V\n  ❌ 缺少必要函数: NEW_SHEET\n  ⚠️ 未找到期望操作: ['NEW_SHEET', 'sum', '汇总']",
+        "quality": "代码质量:\n  ⚠️ 代码过短（可能不完整）"
+      },
+      "pipeline": {
+        "success": false,
+        "attempts": 0,
+        "result": "dry run"
+      },
+      "passed": false,
+      "elapsed_sec": 0.0
+    }
+  ],
+  "meta": {
+    "tool": "excel",
+    "timestamp": "2026-06-28T17:05:57.528030",
+    "label": "",
+    "eval_version": 1
+  }
+}
